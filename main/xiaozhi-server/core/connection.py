@@ -48,6 +48,7 @@ from core.utils import textUtils
 
 
 TAG = __name__
+INITIALIZATION_TIMEOUT_SECONDS = 60
 
 auto_import_modules("plugins_func.functions")
 
@@ -95,6 +96,10 @@ class ConnectionHandler:
 
         self.need_bind = False  # 是否需要绑定设备
         self.bind_completed_event = asyncio.Event()
+        self.initialization_completed_event = asyncio.Event()
+        self.initialization_error = None
+        self._initialization_task = None
+        self._hello_received_event = asyncio.Event()
         self.bind_code = None  # 绑定设备的验证码
         self.last_bind_prompt_time = 0  # 上次播放绑定提示的时间戳(秒)
         self.bind_prompt_interval = 60  # 绑定提示播放间隔(秒)
@@ -247,7 +252,7 @@ class ConnectionHandler:
             self.logger.bind(tag=TAG).info(f"配置输出音频采样率为: {self.sample_rate}")
 
             # 在后台初始化配置和组件（完全不阻塞主循环）
-            asyncio.create_task(self._background_initialize())
+            self._initialization_task = asyncio.create_task(self._background_initialize())
 
             try:
                 async for message in self.websocket:
@@ -336,6 +341,14 @@ class ConnectionHandler:
 
     async def _discard_message_with_bind_prompt(self):
         """丢弃消息并检查是否需要播放绑定提示"""
+        if (
+            self.stop_event.is_set()
+            or not self.initialization_completed_event.is_set()
+            or self.initialization_error is not None
+            or not self.need_bind
+            or self.tts is None
+        ):
+            return
         current_time = time.time()
         # 检查是否需要播放绑定提示
         if current_time - self.last_bind_prompt_time >= self.bind_prompt_interval:
@@ -343,19 +356,46 @@ class ConnectionHandler:
             # 复用现有的绑定提示逻辑
             from core.handle.receiveAudioHandle import check_bind_device
 
-            asyncio.create_task(check_bind_device(self))
+            # 由当前连接任务持有，关闭连接时不会遗留未跟踪的提示任务。
+            await check_bind_device(self)
+
+    async def _wait_for_initialization(self):
+        """等待业务组件就绪，同时允许对端断开立即结束等待。"""
+        if not self.initialization_completed_event.is_set():
+            ready = asyncio.create_task(self.initialization_completed_event.wait())
+            closed = asyncio.create_task(self.websocket.wait_closed())
+            try:
+                done, _ = await asyncio.wait(
+                    (ready, closed), return_when=asyncio.FIRST_COMPLETED
+                )
+                if closed in done:
+                    return False
+            finally:
+                for task in (ready, closed):
+                    if not task.done():
+                        task.cancel()
+                await asyncio.gather(ready, closed, return_exceptions=True)
+        return not self.stop_event.is_set() and self.initialization_error is None
 
     async def _route_message(self, message):
-        """消息路由"""
-        # 检查是否已经获取到真实的绑定状态
-        if not self.bind_completed_event.is_set():
-            # 还没有获取到真实状态，等待直到获取到真实状态或超时
+        """协议握手立即应答，业务消息按顺序等待真实初始化结果。"""
+        if self.stop_event.is_set():
+            return
+        if isinstance(message, str):
             try:
-                await asyncio.wait_for(self.bind_completed_event.wait(), timeout=1)
-            except asyncio.TimeoutError:
-                # 超时仍未获取到真实状态，丢弃消息
-                await self._discard_message_with_bind_prompt()
+                payload = json.loads(message)
+            except json.JSONDecodeError:
+                payload = None
+            message_type = payload.get("type") if isinstance(payload, dict) else None
+            # hello 不使用语音/模型组件；设备 MCP 响应也不能被组件初始化阻塞。
+            if message_type in ("hello", "mcp"):
+                await handleTextMessage(self, message)
+                if message_type == "hello":
+                    self._hello_received_event.set()
                 return
+
+        if not await self._wait_for_initialization():
+            return
 
         # 已经获取到真实状态，检查是否需要绑定
         if self.need_bind:
@@ -603,58 +643,55 @@ class ConnectionHandler:
                 )
             )
 
-    def _initialize_components(self):
-        try:
-            if self.tts is None:
-                self.tts = self._initialize_tts()
-            # 打开语音合成通道
-            asyncio.run_coroutine_threadsafe(
-                self.tts.open_audio_channels(self), self.loop
-            )
-            if self.need_bind:
-                self.bind_completed_event.set()
+    async def _initialize_components(self):
+        """构造在工作线程执行；通道与就绪状态由事件循环管理。"""
+        if self.stop_event.is_set():
+            return
+        if self.tts is None:
+            tts = await asyncio.to_thread(self._initialize_tts)
+            if self.stop_event.is_set():
+                await tts.close()
                 return
-            self.selected_module_str = build_module_string(
-                self.config.get("selected_module", {})
-            )
-            self.logger = create_connection_logger(self.selected_module_str)
+            self.tts = tts
+        await self.tts.open_audio_channels(self)
+        if self.stop_event.is_set() or self.need_bind:
+            return
 
-            """初始化组件"""
-            if self.config.get("prompt") is not None:
-                user_prompt = self.config["prompt"]
-                # 使用快速提示词进行初始化
-                prompt = self.prompt_manager.get_quick_prompt(user_prompt)
-                self.change_system_prompt(prompt)
-                self.logger.bind(tag=TAG).info(
-                    f"快速初始化组件: prompt成功 {prompt[:50]}..."
-                )
+        self.selected_module_str = build_module_string(
+            self.config.get("selected_module", {})
+        )
+        self.logger = create_connection_logger(self.selected_module_str)
 
-            """初始化本地组件"""
-            if self.vad is None:
-                self.vad = self._vad
-            if self.asr is None:
-                self.asr = self._initialize_asr()
-
-            # 初始化声纹识别
-            self._initialize_voiceprint()
-            # 打开语音识别通道
-            asyncio.run_coroutine_threadsafe(
-                self.asr.open_audio_channels(self), self.loop
+        if self.config.get("prompt") is not None:
+            user_prompt = self.config["prompt"]
+            prompt = self.prompt_manager.get_quick_prompt(user_prompt)
+            self.change_system_prompt(prompt)
+            self.logger.bind(tag=TAG).info(
+                f"快速初始化组件: prompt成功 {prompt[:50]}..."
             )
 
-            """加载记忆"""
-            self._initialize_memory()
-            """加载意图识别"""
-            self._initialize_intent()
-            """初始化上报线程"""
-            self._init_report_threads()
-            """更新系统提示词"""
-            self._init_prompt_enhancement()
-            """注入工具调用few-shot示例（仅function_call模式）"""
+        if self.vad is None:
+            self.vad = self._vad
+        if self.asr is None:
+            asr = await asyncio.to_thread(self._initialize_asr)
+            if self.stop_event.is_set():
+                await asr.close()
+                return
+            self.asr = asr
+        await asyncio.to_thread(self._initialize_voiceprint)
+        if self.stop_event.is_set():
+            return
+        await self.asr.open_audio_channels(self)
+        await asyncio.to_thread(self._initialize_memory)
+        if self.stop_event.is_set():
+            return
+        await self._initialize_intent()
+        if self.stop_event.is_set():
+            return
+        self._init_report_threads()
+        await asyncio.to_thread(self._init_prompt_enhancement)
+        if not self.stop_event.is_set():
             self._inject_tool_call_fewshot()
-
-        except Exception as e:
-            self.logger.bind(tag=TAG).error(f"实例化组件失败: {e}")
 
     def _init_prompt_enhancement(self):
 
@@ -788,14 +825,36 @@ class ConnectionHandler:
             self.logger.bind(tag=TAG).warning(f"声纹识别初始化失败: {str(e)}")
 
     async def _background_initialize(self):
-        """在后台初始化配置和组件（完全不阻塞主循环）"""
+        """统一管理初始化结果；超时/失败不冒充设备未绑定。"""
         try:
-            # 异步获取差异化配置
-            await self._initialize_private_config_async()
-            # 在线程池中初始化组件
-            self.executor.submit(self._initialize_components)
+            await asyncio.wait_for(
+                self._initialize_connection(), timeout=INITIALIZATION_TIMEOUT_SECONDS
+            )
+            if not self.stop_event.is_set():
+                state = "unbound" if self.need_bind else "ready"
+                self.logger.bind(tag=TAG).info(
+                    f"连接初始化完成: session_id={self.session_id}, state={state}"
+                )
+        except asyncio.CancelledError:
+            raise
         except Exception as e:
-            self.logger.bind(tag=TAG).error(f"后台初始化失败: {e}")
+            self.initialization_error = e
+            self.logger.bind(tag=TAG).error(
+                f"连接初始化失败: session_id={self.session_id}, error={type(e).__name__}"
+            )
+            if self.websocket is not None and not self.stop_event.is_set():
+                await self.websocket.close(code=1011, reason="Initialization failed")
+        finally:
+            self.initialization_completed_event.set()
+
+    async def _initialize_connection(self):
+        await self._initialize_private_config_async()
+        if self.stop_event.is_set():
+            return
+        # TTS 通道必须使用 hello 协商后的音频参数。
+        await self._hello_received_event.wait()
+        if not self.stop_event.is_set():
+            await self._initialize_components()
 
     async def _initialize_private_config_async(self):
         """从接口异步获取差异化配置（异步版本，不阻塞主循环）"""
@@ -810,13 +869,20 @@ class ConnectionHandler:
                 self.headers.get("device-id"),
                 self.headers.get("client-id", self.headers.get("device-id")),
             )
+            # config_loader 可能吞掉 agent-models 异常，返回空字典或仅替换词。
+            # 正常的设备配置总包含 selected_module，不能误用全局模型放行。
+            if not isinstance(private_config, dict) or not isinstance(
+                private_config.get("selected_module"), dict
+            ):
+                raise RuntimeError("设备配置获取失败")
+            if self.stop_event.is_set():
+                return
             private_config["delete_audio"] = bool(self.config.get("delete_audio", True))
             private_config["tts_timeout"] = self.config.get("tts_timeout", 15)
             self.logger.bind(tag=TAG).info(
                 f"{time.time() - begin_time} 秒，异步获取差异化配置成功: {json.dumps(filter_sensitive_info(private_config), ensure_ascii=False)}"
             )
             self.need_bind = False
-            self.bind_completed_event.set()
         except DeviceNotFoundException as e:
             self.need_bind = True
             private_config = {}
@@ -824,10 +890,7 @@ class ConnectionHandler:
             self.need_bind = True
             self.bind_code = e.bind_code
             private_config = {}
-        except Exception as e:
-            self.need_bind = True
-            self.logger.bind(tag=TAG).error(f"异步获取差异化配置失败: {e}")
-            private_config = {}
+        self.bind_completed_event.set()
 
         init_llm, init_tts, init_memory, init_intent = (
             False,
@@ -927,22 +990,20 @@ class ConnectionHandler:
             ]
 
         # 使用 run_in_executor 在线程池中执行 initialize_modules，避免阻塞主循环
-        try:
-            modules = await self.loop.run_in_executor(
-                None,  # 使用默认线程池
-                initialize_modules,
-                self.logger,
-                private_config,
-                init_vad,
-                init_asr,
-                init_llm,
-                init_tts,
-                init_memory,
-                init_intent,
-            )
-        except Exception as e:
-            self.logger.bind(tag=TAG).error(f"初始化组件失败: {e}")
-            modules = {}
+        modules = await self.loop.run_in_executor(
+            None,  # 使用默认线程池
+            initialize_modules,
+            self.logger,
+            private_config,
+            init_vad,
+            init_asr,
+            init_llm,
+            init_tts,
+            init_memory,
+            init_intent,
+        )
+        if self.stop_event.is_set():
+            return
         if modules.get("tts", None) is not None:
             self.tts = modules["tts"]
         if modules.get("vad", None) is not None:
@@ -998,7 +1059,7 @@ class ConnectionHandler:
                 self.memory.set_llm(self.llm)
                 self.logger.bind(tag=TAG).info("使用主LLM作为意图识别模型")
 
-    def _initialize_intent(self):
+    async def _initialize_intent(self):
         if self.intent is None:
             return
         self.intent_type = self.config["Intent"][
@@ -1028,9 +1089,11 @@ class ConnectionHandler:
 
                 intent_llm_config = self.config["LLM"][intent_llm_name]
                 intent_llm_type = intent_llm_config.get("type", intent_llm_name)
-                intent_llm = llm_utils.create_instance(
-                    intent_llm_type, intent_llm_config
+                intent_llm = await asyncio.to_thread(
+                    llm_utils.create_instance, intent_llm_type, intent_llm_config
                 )
+                if self.stop_event.is_set():
+                    return
                 self.logger.bind(tag=TAG).info(
                     f"为意图识别创建了专用LLM: {intent_llm_name}, 类型: {intent_llm_type}"
                 )
@@ -1040,12 +1103,10 @@ class ConnectionHandler:
                 self.intent.set_llm(self.llm)
                 self.logger.bind(tag=TAG).info("使用主LLM作为意图识别模型")
 
-        """加载统一工具处理器"""
+        if self.stop_event.is_set():
+            return
         self.func_handler = UnifiedToolHandler(self)
-
-        # 异步初始化工具处理器
-        if hasattr(self, "loop") and self.loop:
-            asyncio.run_coroutine_threadsafe(self.func_handler._initialize(), self.loop)
+        await self.func_handler._initialize()
 
     def change_system_prompt(self, prompt):
         self.prompt = prompt
@@ -1543,6 +1604,14 @@ class ConnectionHandler:
     async def close(self, ws=None):
         """资源清理方法"""
         try:
+            # 先停止初始化，避免关闭后再次启动通道或使用已释放的线程池。
+            self.stop_event.set()
+            self.initialization_completed_event.set()
+            task = self._initialization_task
+            if task is not None and task is not asyncio.current_task() and not task.done():
+                task.cancel()
+                await asyncio.gather(task, return_exceptions=True)
+
             # 清理 VAD 连接资源
             if (
                     hasattr(self, "vad")

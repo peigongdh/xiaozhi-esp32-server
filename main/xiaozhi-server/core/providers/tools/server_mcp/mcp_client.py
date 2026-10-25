@@ -107,7 +107,11 @@ class ServerMCPClient:
                 "function": {
                     "name": name,
                     "description": tool.description,
-                    "parameters": tool.inputSchema,
+                    "parameters": (
+                        tool.input_schema
+                        if hasattr(tool, "input_schema")
+                        else tool.inputSchema
+                    ),
                 },
             }
             for name, tool in self.tools_dict.items()

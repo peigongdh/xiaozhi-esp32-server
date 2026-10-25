@@ -162,6 +162,8 @@ Spearheaded by Professor Siyuan Liu's Team (South China University of Technology
 
 ## 部署文档
 
+本工作区的 Ubuntu 运行入口见 [Home Lab Dockge 部署说明](./docs/DOCKGE.md)。
+
 ![Banners](docs/images/banner2.png)
 
 本项目提供两种部署方式，请根据您的具体需求选择：

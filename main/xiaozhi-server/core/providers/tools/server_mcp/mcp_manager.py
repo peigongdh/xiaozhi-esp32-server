@@ -62,6 +62,17 @@ class ServerMCPManager:
                 client_tools = client.get_available_tools()
                 self.tools.extend(client_tools)
 
+        except asyncio.CancelledError:
+            # initialize() 会启动独立 worker；取消时 client 尚未登记，
+            # cleanup_all() 看不到它，必须在此处回收。
+            if client:
+                try:
+                    await client.cleanup()
+                except Exception as e:
+                    logger.bind(tag=TAG).error(
+                        f"Cancelled MCP initialization cleanup failed: {name}, {type(e).__name__}"
+                    )
+            raise
         except asyncio.TimeoutError:
             logger.bind(tag=TAG).error(
                 f"Failed to initialize MCP server {name}: Timeout"

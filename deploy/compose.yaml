@@ -1,0 +1,100 @@
+services:
+  xiaozhi-esp32-server:
+    image: ${SERVER_IMAGE:?fixed server image required}
+    restart: unless-stopped
+    depends_on:
+      xiaozhi-esp32-server-web:
+        condition: service_healthy
+    ports:
+      - "${LAN_IP}:8000:8000"
+      - "${LAN_IP}:8003:8003"
+    environment:
+      TZ: Asia/Shanghai
+      OMP_NUM_THREADS: "4"
+      MKL_NUM_THREADS: "4"
+    volumes:
+      - ${DATA_ROOT}/server:/opt/xiaozhi-esp32-server/data
+      - ${DATA_ROOT}/models/SenseVoiceSmall/model.pt:/opt/xiaozhi-esp32-server/models/SenseVoiceSmall/model.pt:ro
+      - ${MCP_CLIENT_OVERRIDE:?reviewed MCP compatibility file required}:/opt/xiaozhi-esp32-server/core/providers/tools/server_mcp/mcp_client.py:ro
+      - ${CONNECTION_OVERRIDE:?reviewed initialization compatibility file required}:/opt/xiaozhi-esp32-server/core/connection.py:ro
+      - ${MCP_MANAGER_OVERRIDE:?reviewed MCP cancellation compatibility file required}:/opt/xiaozhi-esp32-server/core/providers/tools/server_mcp/mcp_manager.py:ro
+    healthcheck:
+      test: [CMD, python, -c, "import urllib.request; assert urllib.request.urlopen('http://127.0.0.1:8000/', timeout=5).status == 200"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 180s
+    mem_limit: 8g
+    logging: &logging
+      driver: json-file
+      options:
+        max-size: 10m
+        max-file: "3"
+
+  xiaozhi-esp32-server-web:
+    image: ${WEB_IMAGE:?fixed web image required}
+    restart: unless-stopped
+    depends_on:
+      xiaozhi-esp32-server-db:
+        condition: service_healthy
+      xiaozhi-esp32-server-redis:
+        condition: service_healthy
+    ports:
+      - "${WEB_BIND_IP}:8002:8002"
+    environment:
+      TZ: Asia/Shanghai
+      JAVA_TOOL_OPTIONS: -Xms256m -Xmx1024m
+      SPRING_DATASOURCE_DRUID_URL: jdbc:mysql://xiaozhi-esp32-server-db:3306/xiaozhi_esp32_server?useUnicode=true&characterEncoding=UTF-8&serverTimezone=Asia/Shanghai&nullCatalogMeansCurrent=true&connectTimeout=30000&socketTimeout=30000&autoReconnect=true&failOverReadOnly=false&maxReconnects=10
+      SPRING_DATASOURCE_DRUID_USERNAME: xiaozhi
+      SPRING_DATASOURCE_DRUID_PASSWORD: ${MYSQL_PASSWORD:?database password required}
+      SPRING_DATA_REDIS_HOST: xiaozhi-esp32-server-redis
+      SPRING_DATA_REDIS_PASSWORD: ${REDIS_PASSWORD:?redis password required}
+      SPRING_DATA_REDIS_PORT: "6379"
+    volumes:
+      - ${DATA_ROOT}/uploadfile:/uploadfile
+    healthcheck:
+      test: [CMD-SHELL, "wget -q -O /dev/null http://127.0.0.1:8002/xiaozhi/user/pub-config"]
+      interval: 15s
+      timeout: 5s
+      retries: 10
+      start_period: 120s
+    mem_limit: 2g
+    logging: *logging
+
+  xiaozhi-esp32-server-db:
+    image: ${MYSQL_IMAGE:?fixed mysql image required}
+    restart: unless-stopped
+    environment:
+      TZ: Asia/Shanghai
+      MYSQL_ROOT_PASSWORD: ${MYSQL_ROOT_PASSWORD:?root password required}
+      MYSQL_DATABASE: xiaozhi_esp32_server
+      MYSQL_USER: xiaozhi
+      MYSQL_PASSWORD: ${MYSQL_PASSWORD}
+    command: [--character-set-server=utf8mb4, --collation-server=utf8mb4_unicode_ci]
+    volumes:
+      - ${DATA_ROOT}/mysql:/var/lib/mysql
+    healthcheck:
+      test: [CMD-SHELL, 'MYSQL_PWD="$$MYSQL_PASSWORD" mysql -h 127.0.0.1 -u xiaozhi -D xiaozhi_esp32_server -Nse "SELECT 1"']
+      interval: 10s
+      timeout: 5s
+      retries: 15
+      start_period: 60s
+    mem_limit: 2g
+    logging: *logging
+
+  xiaozhi-esp32-server-redis:
+    image: ${REDIS_IMAGE:?fixed redis image required}
+    restart: unless-stopped
+    environment:
+      TZ: Asia/Shanghai
+      REDIS_PASSWORD: ${REDIS_PASSWORD}
+    command: [sh, -c, 'exec redis-server --appendonly yes --requirepass "$$REDIS_PASSWORD"']
+    volumes:
+      - ${DATA_ROOT}/redis:/data
+    healthcheck:
+      test: [CMD-SHELL, 'REDISCLI_AUTH="$$REDIS_PASSWORD" redis-cli ping | grep -q PONG']
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    mem_limit: 512m
+    logging: *logging
